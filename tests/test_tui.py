@@ -101,6 +101,13 @@ class TextTests(unittest.TestCase):
         self.assertEqual([line for line in service_lines(project) if line.startswith("Browser (running)")],
                          ["Browser (running) http://127.0.0.1:52286/"])
 
+    def test_browser_link_keeps_its_access_token(self):
+        url = ("http://127.0.0.1:52282/vnc.html?autoconnect=1&resize=remote"
+               "&path=websockify%3Ftoken%3Dfixture-access-token-0123456789abcdefABCDEF")
+        project = {"status": "running", "service_items": [
+            {"name": "novnc", "state": "running", "protocol": "http", "address": url, "scope": "published"}]}
+        self.assertEqual(service_lines(project), [f"Browser (running) {url}"])
+
     def test_optional_desktop_has_one_address_without_internal_components(self):
         project = {"service_items": [
             {"name": "desktop-http", "state": "stopped", "address": "http://192.168.1.73:49300/", "scope": "published"},

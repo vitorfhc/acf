@@ -56,7 +56,7 @@ function descendants(root, predicate) {
     return [root, ...root.childNodes.flatMap(child => descendants(child, () => true))].filter(predicate);
 }
 
-function harness({storage = new Map(), preview = {}, completeText = '# Complete file\n'} = {}) {
+function harness({storage = new Map(), preview = {}, completeText = '# Complete file\n', base = ''} = {}) {
     const html = readFileSync(new URL('files.html', runtime), 'utf8');
     const script = [...html.matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/g)]
         .map(match => match[1]).find(source => source.includes('function renderFile('));
@@ -80,7 +80,7 @@ function harness({storage = new Map(), preview = {}, completeText = '# Complete 
             createTextNode: text => Object.assign(new Element('#text'), {text}),
             body: new Element('body'),
         },
-        location: {pathname: '/browse/home/dev/project/report.md', origin: 'http://files.test:8090'},
+        location: {pathname: base + '/browse/home/dev/project/report.md', origin: 'http://files.test:8090'},
         localStorage: {getItem: key => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value)},
         navigator: {clipboard: {async writeText(text) { clipboard.push(text); }}},
         isSecureContext: true,
@@ -89,8 +89,10 @@ function harness({storage = new Map(), preview = {}, completeText = '# Complete 
         async fetch(url) {
             const request = new URL(url);
             requests.push(request);
-            assert.ok(['/api/preview', '/api/text'].includes(request.pathname), `unexpected request: ${request}`);
-            return {ok: true, async json() { return request.pathname === '/api/text' ? {text: completeText} : result; }};
+            assert.ok(request.pathname.startsWith(base + '/api/'), `request outside the access token: ${request}`);
+            const route = request.pathname.slice(base.length);
+            assert.ok(['/api/preview', '/api/text'].includes(route), `unexpected request: ${request}`);
+            return {ok: true, async json() { return route === '/api/text' ? {text: completeText} : result; }};
         },
     });
     context.window = context;
@@ -217,6 +219,24 @@ test('storage restrictions and an unavailable parser still leave the source read
     assert.equal(pre.textContent, '# Still readable\n');
     assert.equal(rendered.disabled, true);
     assert.match(content.textContent, /Showing the raw file/);
+});
+
+test('the access token path prefix is kept for links, API requests, and downloads', async () => {
+    const base = '/fixture-access-token-0123456789abcdefABCDEF';
+    const app = harness({base});
+    const rendered = app.markdown('[Sibling](other.md) [Root](/etc/hosts) [Absolute](http://files.test:8090' + base + '/browse/etc/passwd) [Tokenless](http://files.test:8090/browse/etc/group)');
+    assert.match(rendered, new RegExp('href="' + base + '/browse/home/dev/project/other\\.md"'));
+    assert.match(rendered, new RegExp('href="' + base + '/browse/etc/hosts"'));
+    assert.match(rendered, new RegExp('href="' + base + '/browse/etc/passwd"'));
+    assert.doesNotMatch(rendered, /href="\/browse\//, 'every local link stays below the token');
+    await app.render('/home/dev/project/report.md');
+    const content = app.node('content');
+    const copy = descendants(content, node => node.tagName === 'BUTTON' && node.textContent === 'Copy contents')[0];
+    await copy.handlers.click();
+    assert.ok(app.requests.length && app.requests.every(url => url.pathname.startsWith(base + '/api/')));
+    const download = descendants(content, node => node.tagName === 'A' && node.textContent === 'Download')[0];
+    assert.equal(download.href, base + '/download/home/dev/project/report.md');
+    assert.equal(app.context.currentPath(), '/home/dev/project/report.md');
 });
 
 test('copy and download preserve the original full source, including a truncated rendered preview', async () => {

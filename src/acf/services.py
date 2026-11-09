@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ipaddress
+from urllib.parse import quote
 
 from .addresses import host_port, published_host
 
@@ -16,6 +17,7 @@ KNOWN_ENDPOINTS = {
     'browser-primary': (9222, 'http', '/'), 'browser-secondary': (9224, 'http', '/'),
 }
 LOCAL_PORTS = {5900, 5901, 5902, 9222, 9223, 9224, 9225}
+VNC_PATH = '/vnc.html?autoconnect=1&resize=remote'
 CONTROL_LABELS = {'browser': 'Browser', 'desktop': 'Desktop', 'files': 'Files', 'caido': 'Caido'}
 
 
@@ -34,6 +36,22 @@ def service_controls(services, controls=None, protocol=0):
     return [dict(name=name, label=label,
                  state=states[name] if states[name] in ('running', 'stopped', 'failed', 'starting') else 'unknown')
             for name, label in CONTROL_LABELS.items() if name in states]
+
+
+def authenticated_path(port, path, access_token):
+    """Add the per-boot token that the Files and noVNC services require.
+
+    Files takes it as the first path segment and websockify as the WebSocket
+    query, which noVNC reads from its path setting. Neither uses cookies:
+    those are shared by every port on the host, including other projects.
+    """
+    if not access_token:
+        return path
+    if port == 8081:
+        return '/' + access_token + path
+    if port in (6080, 6082):
+        return VNC_PATH + '&path=' + quote('websockify?token=' + access_token, safe='')
+    return path
 
 
 def endpoint_address(port, protocol, listeners, published, container_ip, path='/', *, advertise_host='', docker_host=None):
@@ -64,7 +82,7 @@ def endpoint_address(port, protocol, listeners, published, container_ip, path='/
     return address, scope
 
 
-def service_items(services, listeners, published, container_ip, settings, *, docker_host=None):
+def service_items(services, listeners, published, container_ip, settings, *, docker_host=None, access_token=None):
     """Services are separate rows; configured extra ports can override detection."""
     services = services if isinstance(services, dict) else {}
     published = published if isinstance(published, dict) else {}
@@ -91,6 +109,7 @@ def service_items(services, listeners, published, container_ip, settings, *, doc
             result.append(dict(name=name, state=state, protocol='', address='', scope='process'))
             continue
         port, protocol, path = known
+        path = authenticated_path(port, path, access_token)
         claimed.add(port)
         rows = sockets.get(port, [])
         address, scope = endpoint_address(port, protocol, rows, published, container_ip, path,
@@ -113,7 +132,9 @@ def service_items(services, listeners, published, container_ip, settings, *, doc
                     6082: ('desktop-http', 'http')}
         if port in defaults and not rows and not config:
             name, protocol = defaults[port]
-        path = '/vnc.html?autoconnect=1&resize=remote' if port == 6080 and name == 'novnc' else '/'
+        path = VNC_PATH if port == 6080 and name == 'novnc' else '/'
+        # Extra mappings cannot use these reserved ports, so only ACF serves them.
+        path = authenticated_path(port, path, access_token)
         address, scope = endpoint_address(port, protocol, rows, published, container_ip, path,
                                           advertise_host=advertise_host, docker_host=docker_host)
         result.append(dict(name=name, state='running' if rows else 'not listening', protocol=protocol,

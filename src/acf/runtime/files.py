@@ -5,6 +5,7 @@ import argparse
 import codecs
 import contextlib
 import errno
+import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
@@ -25,6 +26,9 @@ DIRECTORY_LIMIT = 10000
 PAGE_LIMIT = 1000
 MAX_HANDLERS = 8
 VIRTUAL_ROOTS = (Path("/proc"), Path("/sys"), Path("/dev"))
+# The host issues a new token at every boot and delivers it during Sync.
+ACCESS_TOKEN_FILE = "/run/acf/access-token"
+MIN_TOKEN_LENGTH = 32
 APP_ASSETS = {
     "/assets/markdown-it.min.js": ("vendor/markdown-it.min.js", "text/javascript; charset=utf-8"),
 }
@@ -64,10 +68,11 @@ class FileExplorerServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address, *, root=None, html_path=None):
+    def __init__(self, address, *, root=None, html_path=None, token_path=None):
         self.root = Path(root or os.environ.get("ACF_FILES_ROOT", "/")).resolve(strict=True)
         if not self.root.is_dir():
             raise ValueError("File explorer root must be a directory")
+        self.token_path = Path(token_path or os.environ.get("ACF_FILES_TOKEN_FILE", ACCESS_TOKEN_FILE))
         self.html_path = Path(html_path or Path(__file__).with_name("files.html"))
         self.html = self.html_path.read_bytes()
         # Serve only these bundled assets, never a requested filesystem path.
@@ -109,6 +114,14 @@ class FileExplorerServer(ThreadingHTTPServer):
             super().process_request_thread(request, client_address)
         finally:
             self.handler_slots.release()
+
+    def access_token(self):
+        """Read the token for every request; Sync may deliver or replace it after boot."""
+        try:
+            token = self.token_path.read_text(encoding="ascii").strip()
+        except (OSError, UnicodeError):
+            return None
+        return token if len(token) >= MIN_TOKEN_LENGTH else None
 
     def resolve(self, value):
         value = clean_path(value)
@@ -343,6 +356,17 @@ class FileExplorerHandler(BaseHTTPRequestHandler):
             raise FileError(400, "Duplicate query parameter: " + key)
         return values[0]
 
+    def authorized_route(self, path):
+        """Strip the access token path prefix. Cookies are not used because they
+        are shared by every port on a host, including other projects."""
+        expected = self.server.access_token()
+        if expected is None:
+            raise FileError(503, "The file explorer is waiting for its access token; Sync this environment from the dashboard")
+        token, separator, route = path[1:].partition("/")
+        if not hmac.compare_digest(token.encode(), expected.encode()):
+            raise FileError(403, "Open Files from the ACF dashboard; its link contains this environment's access token")
+        return "/" + token, ("/" + route if separator else "")
+
     def download(self, value):
         with self.server.open_regular(value) as (value, handle, info):
             name = posixpath.basename(value)
@@ -372,20 +396,25 @@ class FileExplorerHandler(BaseHTTPRequestHandler):
             if parsed.scheme or parsed.netloc or not parsed.path.startswith("/") or parsed.path.startswith("//"):
                 raise FileError(400, "Invalid request path")
             query = parse_qs(parsed.query, keep_blank_values=True, max_num_fields=20)
-            if parsed.path == "/":
-                self.respond(303, headers={"Location": "/browse/"})
-            elif parsed.path == "/browse" or parsed.path.startswith("/browse/"):
+            if parsed.path.startswith("/assets/"):
+                # Bundled libraries are public; they contain no project data.
+                if parsed.path not in self.server.assets:
+                    raise FileError(404, "Endpoint not found")
+                body, content_type = self.server.assets[parsed.path]
+                self.respond(200, body, content_type)
+                return
+            prefix, route = self.authorized_route(parsed.path)
+            if route in ("", "/"):
+                self.respond(303, headers={"Location": prefix + "/browse/"})
+            elif route == "/browse" or route.startswith("/browse/"):
                 # Directory and file URLs both serve the app. Files themselves
                 # are only ever returned as JSON text or forced downloads.
                 self.respond(200, self.server.html, "text/html; charset=utf-8")
-            elif parsed.path in self.server.assets:
-                body, content_type = self.server.assets[parsed.path]
-                self.respond(200, body, content_type)
-            elif parsed.path == "/api/config":
+            elif route == "/api/config":
                 self.json_response(200, self.server.configuration())
-            elif parsed.path == "/api/stat":
+            elif route == "/api/stat":
                 self.json_response(200, self.server.metadata(self.argument(query, "path", "/")))
-            elif parsed.path == "/api/list":
+            elif route == "/api/list":
                 try:
                     offset = int(self.argument(query, "offset", "0"))
                     limit = int(self.argument(query, "limit", "250"))
@@ -396,12 +425,12 @@ class FileExplorerHandler(BaseHTTPRequestHandler):
                 result = self.server.listing(self.argument(query, "path", "/"), offset, limit,
                                              self.argument(query, "directories", "0") == "1")
                 self.json_response(200, result)
-            elif parsed.path == "/api/preview":
+            elif route == "/api/preview":
                 self.json_response(200, self.server.preview(self.argument(query, "path", "/")))
-            elif parsed.path == "/api/text":
+            elif route == "/api/text":
                 self.json_response(200, self.server.full_text(self.argument(query, "path", "/")))
-            elif parsed.path.startswith("/download/"):
-                self.download(unquote(parsed.path[len("/download"):], errors="surrogatepass"))
+            elif route.startswith("/download/"):
+                self.download(unquote(route[len("/download"):], errors="surrogatepass"))
             else:
                 raise FileError(404, "Endpoint not found")
         except FileError as exc:
@@ -456,7 +485,7 @@ class FileExplorerHandler(BaseHTTPRequestHandler):
             parsed = urlsplit(self.path)
             if parsed.scheme or parsed.netloc or not parsed.path.startswith("/") or parsed.path.startswith("//"):
                 raise FileError(400, "Invalid request path")
-            if parsed.path != "/api/upload":
+            if self.authorized_route(parsed.path)[1] != "/api/upload":
                 self.method_not_allowed()
                 return
             query = parse_qs(parsed.query, keep_blank_values=True, max_num_fields=20)
@@ -485,7 +514,7 @@ class FileExplorerHandler(BaseHTTPRequestHandler):
                 self.json_response(403, {"error": "This file could not be uploaded"})
 
     def method_not_allowed(self):
-        allow = "GET, HEAD, POST" if urlsplit(self.path).path == "/api/upload" else "GET, HEAD"
+        allow = "GET, HEAD, POST" if urlsplit(self.path).path.endswith("/api/upload") else "GET, HEAD"
         self.respond(405, b'{"error":"This method is not supported; use the upload endpoint to add files"}',
                      headers={"Allow": allow})
 

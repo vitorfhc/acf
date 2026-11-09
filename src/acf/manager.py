@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import shlex
 import shutil
@@ -25,6 +26,8 @@ from .services import CONTROL_LABELS, service_controls, service_items
 SERVICE_PORTS = INTERNAL_PORTS
 VOLUMES = {"workspace": "/workspace", "root": "/root", "home": "/home/agent", "tools": "/opt/acf-tools"}
 CONTROL_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
+# Files and noVNC accept only this token; token_urlsafe(32) produces 43 characters.
+ACCESS_TOKEN = re.compile(r"[A-Za-z0-9_-]{32,128}")
 FILE_EXPLORER_ASSETS = (
     "files.py", "files.html", "vendor/markdown-it.min.js", "vendor/markdown-it.NOTICE",
     "vendor/markdown-it.LICENSE", "vendor/markdown-it.THIRD-PARTY-LICENSES",
@@ -261,8 +264,10 @@ class Manager:
         container, guard, _ = self.names(name)
         obj = self.owned("container", container)
         guard_obj = self.owned("container", guard)
-        if obj and obj["State"]["Running"] and not (guard_obj and guard_obj["State"]["Running"]):
+        running = bool(obj and obj["State"]["Running"])
+        if running and not (guard_obj and guard_obj["State"]["Running"]):
             self.docker.run("stop", container)
+            running = False
         if obj and guard_obj and not self.guard_matches(obj, guard_obj, guard):
             if obj["State"]["Running"] and guard_obj["State"]["Running"]:
                 self.docker.run("stop", container)
@@ -284,6 +289,10 @@ class Manager:
         # Update the boot/browser code before an older image can launch a browser.
         self._copy_runtime_commands(container)
         self._copy_service_settings(container, self.config.project(name))
+        # A boot may receive different host ports, so links saved for old ports
+        # (including noVNC's stored settings) must stop working. Attaching to a
+        # running environment keeps the current token and open browser tabs.
+        self._access_token(name, rotate=not running)
         self.docker.run("start", container)
         return self._sync(name)
 
@@ -384,6 +393,16 @@ class Manager:
         # and credential delivery must use the container's system utilities.
         return self.docker.run(*flags, "--env", f"PATH={CONTROL_PATH}", container,
                                *command, input=input, max_output=131072, **options)
+
+    def _access_token(self, name, rotate=False):
+        """Return the host-issued token for published Files and noVNC services."""
+        state = self.state(name)
+        token = state.get("access_token")
+        if rotate or not isinstance(token, str) or not ACCESS_TOKEN.fullmatch(token):
+            token = secrets.token_urlsafe(32)
+            state["access_token"] = token
+            self.save(name, state)
+        return token
 
     def _oob_key(self, settings):
         path = self.config.secrets(settings).get("OOB_SSH_KEY")
@@ -490,6 +509,16 @@ class Manager:
             self._control_exec(container, "sh", "-c",
                             "set -e; umask 077; cat > /run/acf/secrets.json.tmp; chmod 600 /run/acf/secrets.json.tmp; "
                             "mv -f /run/acf/secrets.json.tmp /run/acf/secrets.json; rm -f /run/acf/secrets.env", input=secret_text)
+            # Files reads the plain token; websockify's TokenFile plugin maps it to
+            # each local VNC server. Like other secrets, it travels on stdin.
+            self._control_exec(container, "sh", "-c",
+                            "set -e; umask 077; IFS= read -r token; "
+                            "printf '%s\\n' \"$token\" > /run/acf/access-token.tmp; "
+                            "printf '%s: 127.0.0.1:5901\\n' \"$token\" > /run/acf/novnc-token.tmp; "
+                            "printf '%s: 127.0.0.1:5902\\n' \"$token\" > /run/acf/desktop-token.tmp; "
+                            "for name in access novnc desktop; do "
+                            "mv -f /run/acf/$name-token.tmp /run/acf/$name-token; done",
+                            input=self._access_token(name) + "\n")
             self._control_exec(container, "rm", "-f", "/run/acf/oob_key")
             if oob_key is not None:
                 self._control_exec(container, "sh", "-c",
@@ -641,6 +670,9 @@ class Manager:
         if status == 'running' and data['control_protocol'] < 2:
             data['service_notice'] = ('Browser/Desktop controls need the updated image and service supervisor. '
                                       'Build container images, then Apply settings when you are ready to restart sessions.')
+        elif status == 'running' and data['control_protocol'] < 3:
+            data['service_notice'] = ('Browser and Desktop accept connections without an access token until '
+                                      'this environment restarts. Stop and Start it to require the token.')
         # Display-host edits take effect on refresh. Binding changes still need
         # Apply; actual Docker publications remain the source of truth.
         current_network = self.config.project(name)['network']
@@ -650,7 +682,9 @@ class Manager:
         data['advertise_host'] = advertise_host
         data['docker_host'] = self.docker_host()
         data['host_ip'] = published_host(current_network['bind'], advertise_host, data['docker_host'])
-        data['service_items'] = service_items(service_states, listeners, published, ip, settings, docker_host=data['docker_host'])
+        token = state.get('access_token')
+        data['service_items'] = service_items(service_states, listeners, published, ip, settings, docker_host=data['docker_host'],
+                                              access_token=token if isinstance(token, str) and ACCESS_TOKEN.fullmatch(token) else None)
         data['urls'] = service_urls(data)
         return data
 

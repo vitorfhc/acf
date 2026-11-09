@@ -12,7 +12,7 @@ import threading
 import time
 import unicodedata
 from typing import Any, Callable
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 from .config import ConfigError, validate_name, validate_settings
 from .services import LOCAL_PORTS
@@ -133,7 +133,8 @@ def service_entries(project: dict[str, Any]) -> list[dict[str, str]]:
             item["name"] = "Browser"
             try:
                 url = urlsplit(item["address"])
-                if url.scheme in {"http", "https"} and url.netloc:
+                # The root page cannot forward an access token; keep links that carry one.
+                if url.scheme in {"http", "https"} and url.netloc and "path" not in parse_qs(url.query):
                     item["address"] = urlunsplit((url.scheme, url.netloc, "/", "", ""))
             except ValueError:
                 pass

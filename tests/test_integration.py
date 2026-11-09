@@ -18,8 +18,9 @@ from acf.config import Config
 from acf.manager import Manager
 
 
-# Complete the noVNC WebSocket/RFB handshake without supplying credentials.
-NOVNC_NO_AUTH_CHECK = r'''
+# Complete the noVNC WebSocket/RFB handshake. websockify requires the access token
+# in the URL; the loopback VNC server behind it has no separate password.
+NOVNC_HANDSHAKE = r'''
 const socket = new WebSocket(process.env.ACF_TEST_NOVNC_URL || 'ws://127.0.0.1:6080/websockify', ['binary']);
 socket.binaryType = 'arraybuffer';
 let buffer = Buffer.alloc(0), stage = 0;
@@ -48,7 +49,7 @@ socket.onmessage = event => {
         if (buffer.length < 24 || buffer.length < 24 + buffer.readUInt32BE(20)) return;
         if (!buffer.readUInt16BE(0) || !buffer.readUInt16BE(2)) throw Error('Missing desktop framebuffer');
         stage = 4; clearTimeout(timeout); socket.onmessage = null; socket.close();
-        console.log('noVNC desktop connected without credentials'); return;
+        console.log('noVNC desktop connected'); return;
       }
     }
   } catch (error) { console.error(error.message); process.exit(1); }
@@ -167,12 +168,14 @@ enabled = []
                     manager.exec('alpha', ['rm', '-rf', '/tmp/acf-test-bin'], interactive=False)
                     self.assertEqual(json.loads(manager.exec('alpha', ['cat', '/run/acf/secrets.json'], interactive=False).stdout), saved_keys)
                     manager.sync('alpha')
-                with self.subTest('LAN service exposure without file credentials'):
+                with self.subTest('LAN service exposure requires the access token'):
                     info = manager.details('alpha')
                     network_info = manager.owned('container', guard)['NetworkSettings']
                     for mappings in network_info['Ports'].values():
                         self.assertTrue(all(m['HostIp'] == '0.0.0.0' for m in mappings))
+                    token = manager.state('alpha')['access_token']
                     base = info['urls']['files'].rstrip('/')
+                    self.assertTrue(base.endswith('/' + token))
                     host = urlsplit(base).hostname
                     self.assertNotIn(host, ('127.0.0.1', 'localhost', '0.0.0.0', '::', '::1'))
                     deadline = time.monotonic() + 45
@@ -200,6 +203,13 @@ enabled = []
                         urllib.request.urlopen(urllib.request.Request(base + '/api/file?path=/workspace/proof.txt', data=b'replace', method='PUT'), timeout=5)
                     self.assertEqual(error.exception.code, 405)
                     error.exception.close()
+                    files_origin = 'http://' + host_port(host, info['ports']['files'])
+                    for path in ('/', '/browse/', '/api/list?path=/workspace', '/download/workspace/proof.txt',
+                                 '/' + 'x' * len(token) + '/api/list?path=/workspace'):
+                        with self.assertRaises(urllib.error.HTTPError) as error:
+                            urllib.request.urlopen(files_origin + path, timeout=5)
+                        self.assertEqual(error.exception.code, 403)
+                        error.exception.close()
                     self.assertNotIn('novnc_secondary', info['ports'])
                     self.assertNotIn('6081/tcp', network_info['Ports'])
                     browser_base = 'http://' + host_port(host, info['ports']['novnc'])
@@ -217,12 +227,15 @@ enabled = []
                         self.assertIn(b'acf-profiles', response.read())
                     deadline = time.monotonic() + 30
                     while True:
-                        connection = manager.docker.run('exec', name, 'node', '-e', NOVNC_NO_AUTH_CHECK, check=False, timeout=15)
+                        connection = manager.docker.run('exec', '--env', 'ACF_TEST_NOVNC_URL=ws://127.0.0.1:6080/websockify?token=' + token,
+                                                        name, 'node', '-e', NOVNC_HANDSHAKE, check=False, timeout=15)
                         if connection.returncode == 0:
                             break
                         if time.monotonic() > deadline:
-                            self.fail(connection.stderr or 'No unauthenticated noVNC desktop connection')
+                            self.fail(connection.stderr or 'No noVNC desktop connection with the access token')
                         time.sleep(.5)
+                    refused = manager.docker.run('exec', name, 'node', '-e', NOVNC_HANDSHAKE, check=False, timeout=15)
+                    self.assertNotEqual(refused.returncode, 0, 'noVNC accepted a connection without the access token')
                 with self.subTest('dashboard service rows include built-in endpoints without secrets'):
                     rows = manager.list_projects()
                     listed = next(project for project in rows if project['name'] == 'alpha')
@@ -234,7 +247,8 @@ enabled = []
                     self.assertEqual(builtins['files']['address'], base + '/')
                     self.assertEqual(builtins['files']['scope'], 'published')
                     self.assertEqual(builtins['files']['protocol'], 'http')
-                    self.assertEqual(builtins['novnc']['address'], browser_base + '/vnc.html?autoconnect=1&resize=remote')
+                    self.assertEqual(builtins['novnc']['address'], browser_base + '/vnc.html?autoconnect=1&resize=remote'
+                                     '&path=websockify%3Ftoken%3D' + token)
                     self.assertEqual(builtins['novnc']['scope'], 'published')
                     self.assertEqual(builtins['caido']['state'], 'stopped')
                     for item in builtins.values():

@@ -45,12 +45,15 @@ class FileExplorerHTTP(unittest.TestCase):
         self.root.mkdir()
         self.html = self.base / "explorer.html"
         self.html.write_text("<!doctype html><title>File explorer fixture</title>")
+        self.token = "fixture-access-token-0123456789abcdefABCDEF"
+        self.token_path = self.base / "access-token"
+        self.token_path.write_text(self.token + "\n")
         self.logs = io.StringIO()
         capture = contextlib.redirect_stderr(self.logs)
         capture.__enter__()
         self.addCleanup(capture.__exit__, None, None, None)
         self.server = explorer.FileExplorerServer(
-            ("127.0.0.1", 0), root=self.root, html_path=self.html)
+            ("127.0.0.1", 0), root=self.root, html_path=self.html, token_path=self.token_path)
         self.thread = threading.Thread(target=self.server.serve_forever,
                                        kwargs={"poll_interval": 0.01}, daemon=True)
         self.thread.start()
@@ -61,7 +64,10 @@ class FileExplorerHTTP(unittest.TestCase):
         self.server.server_close()
         self.thread.join(timeout=2)
 
-    def request(self, path, method="GET", body=None, headers=None):
+    def request(self, path, method="GET", body=None, headers=None, token=True):
+        # Every route except the public bundled assets lives below the token.
+        if token and not path.startswith("/assets/"):
+            path = "/" + self.token + path
         request_headers = dict(headers or {})
         connection = http.client.HTTPConnection(*self.server.server_address, timeout=3)
         try:
@@ -77,9 +83,9 @@ class FileExplorerHTTP(unittest.TestCase):
         self.assertIn("application/json", headers["content-type"])
         return json.loads(body)
 
-    def upload(self, name, data=b"uploaded bytes", directory="/", **headers):
+    def upload(self, name, data=b"uploaded bytes", directory="/", token=True, **headers):
         return self.request("/api/upload?" + urlencode({"path": directory, "name": name}),
-                            method="POST", body=data,
+                            method="POST", body=data, token=token,
                             headers={"Content-Type": "application/octet-stream", "X-ACF-Upload": "1", **headers})
 
     def test_upload_preserves_bytes_in_selected_folder_and_encodes_filename(self):
@@ -232,7 +238,7 @@ class FileExplorerHTTP(unittest.TestCase):
     def raw_upload(self, headers, data=b""):
         connection = socket.create_connection(self.server.server_address, timeout=3)
         self.addCleanup(connection.close)
-        head = ("POST /api/upload?path=/&name=partial.txt HTTP/1.1\r\n"
+        head = (f"POST /{self.token}/api/upload?path=/&name=partial.txt HTTP/1.1\r\n"
                 "Host: localhost\r\nContent-Type: application/octet-stream\r\n"
                 "X-ACF-Upload: 1\r\n" + headers + "\r\n")
         connection.sendall(head.encode("ascii") + data)
@@ -264,28 +270,61 @@ class FileExplorerHTTP(unittest.TestCase):
         self.assertEqual(target.read_bytes(), b"created elsewhere")
         self.assertEqual(list(self.root.glob(".acf-upload-*")), [])
 
-    def test_explorer_and_file_endpoints_need_no_token_or_cookie(self):
+    ENDPOINTS = ("/browse/", "/browse/notes.txt", "/api/config", "/api/list?path=/",
+                 "/api/stat?path=/notes.txt", "/api/preview?path=/notes.txt",
+                 "/api/text?path=/notes.txt", "/download/notes.txt")
+
+    def test_explorer_and_file_endpoints_work_below_the_access_token_without_cookies(self):
         (self.root / "notes.txt").write_text("fixture contents")
-        for path in ("/browse/", "/browse/notes.txt", "/api/list?path=/",
-                     "/api/stat?path=/notes.txt", "/api/preview?path=/notes.txt",
-                     "/api/text?path=/notes.txt", "/download/notes.txt"):
+        for path in self.ENDPOINTS:
             with self.subTest(path=path):
                 status, headers, _ = self.request(path)
                 self.assertEqual(status, 200)
                 self.assertNotIn("set-cookie", headers)
                 self.assertIn("no-store", headers.get("cache-control", ""))
                 self.assertEqual(headers.get("referrer-policy"), "no-referrer")
-        status, headers, _ = self.request("/")
-        self.assertEqual(status, 303)
-        self.assertEqual(headers["location"], "/browse/")
+        for path in ("/", ""):
+            with self.subTest(path=path):
+                status, headers, _ = self.request(path)
+                self.assertEqual(status, 303)
+                self.assertEqual(headers["location"], "/" + self.token + "/browse/")
         self.assertEqual(self.request("/download/notes.txt")[2], b"fixture contents")
 
-    def test_old_access_links_and_cookies_do_not_block_access(self):
-        status, headers, _ = self.request("/browse/?token=obsolete-token",
-                                        headers={"Cookie": "sandbox_files=obsolete-token"})
-        self.assertEqual(status, 200)
+    def test_missing_or_wrong_token_is_rejected_for_every_endpoint(self):
+        (self.root / "notes.txt").write_text("fixture contents")
+        wrong = "x" * len(self.token)
+        for prefix in ("", "/" + wrong, "/" + self.token[:-1], "/" + self.token + "x"):
+            for path in ("/", *self.ENDPOINTS):
+                with self.subTest(prefix=prefix, path=path):
+                    status, headers, body = self.request(prefix + path, token=False)
+                    self.assertEqual(status, 403, body)
+                    self.assertNotIn(b"fixture contents", body)
+                    self.assertNotIn("set-cookie", headers)
+        status, _, _ = self.upload("blocked.txt", token=False)
+        self.assertEqual(status, 403)
+        self.assertFalse((self.root / "blocked.txt").exists())
+
+    def test_query_tokens_and_cookies_do_not_grant_access(self):
+        # Cookies reach every port on a host, so a token there would leak to other projects.
+        status, headers, _ = self.request("/browse/?token=" + self.token, token=False,
+                                          headers={"Cookie": "sandbox_files=" + self.token})
+        self.assertEqual(status, 403)
         self.assertNotIn("set-cookie", headers)
-        self.assertNotIn("obsolete-token", self.logs.getvalue())
+        self.assertNotIn(self.token, self.logs.getvalue())
+
+    def test_explorer_fails_closed_until_a_token_is_delivered_and_reads_replacements(self):
+        self.token_path.unlink()
+        status, _, body = self.request("/api/list?path=/")
+        self.assertEqual(status, 503, body)
+        self.token_path.write_text("too-short\n")
+        self.assertEqual(self.request("/api/list?path=/")[0], 503)
+        replacement = "replacement-access-token-0123456789abcdefAB"
+        self.token_path.write_text(replacement + "\n")
+        self.assertEqual(self.request("/api/list?path=/")[0], 403)
+        self.assertEqual(self.request("/" + replacement + "/api/list?path=/", token=False)[0], 200)
+        # Bundled libraries stay public so the page can load before the token arrives.
+        self.token_path.unlink()
+        self.assertEqual(self.request("/assets/markdown-it.min.js")[0], 200)
 
     def test_directory_urls_reload_and_encoded_names_round_trip(self):
         folder = self.root / "notes & sources #1"

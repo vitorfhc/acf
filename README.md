@@ -78,7 +78,7 @@ when stopped, plus `d delete`. These work directly from the main dashboard.
 | `s` | Start or stop selected project |
 | `r` | Restart |
 | `u` | Sync selected project's shared resources and credentials |
-| `i` | Show details without secrets |
+| `i` | Show details without API keys; service links include their access token |
 | `v` | Start/stop services and show endpoints |
 | Page Up / Page Down | Scroll services in the main dashboard |
 | `a` | Show service addresses |
@@ -120,8 +120,11 @@ actions remain available when no project is selected. Deletion requires typing
 host remain. Applying configuration asks for the project name because it stops
 sessions and discards the container's writable OS layer.
 
-The service-address panel lists copyable endpoints. Files and Browser open
-directly without a token or password.
+The service-address panel lists copyable endpoints. Files, Browser, and Desktop
+links contain a random access token that ACF issues each time the environment
+starts; treat them like passwords. Opening those ports without the token's link
+is refused. Restarting an environment replaces the token, so open its services
+from the dashboard again afterwards.
 Diagnostics inspect deployed container settings; they are not a security
 certification or a complete attack simulation.
 
@@ -533,9 +536,9 @@ network IP; custom DNS is optional.
 | Service | Container port | Access |
 | --- | --- | --- |
 | Caido UI and proxy | `8080` | Caido's own account/project setup |
-| Web file explorer | `8081` | Opens directly without credentials |
-| Browser profiles | `6080` | Opens directly; Primary and Secondary profile buttons |
-| Full desktop | `6082` | Stopped by default; separate HTTP port, opens directly when started |
+| Web file explorer | `8081` | Dashboard link with the access token in its path |
+| Browser profiles | `6080` | Dashboard link with the access token; Primary and Secondary profile buttons |
+| Full desktop | `6082` | Stopped by default; separate HTTP port, dashboard link with the access token |
 
 Press `v`, or choose **Start/stop services and endpoints** in the actions menu,
 to manage Browser, Desktop, Files, and Caido. Select with Up/Down, then press
@@ -575,7 +578,10 @@ buttons, or **Ctrl+Alt+1** / **Ctrl+Alt+2**, to switch browser profiles on the
 shared desktop. Selecting a stopped profile starts it. Both profiles retain
 independent Chromium processes, cookies, data directories, and debugging ports;
 they share the display, VNC connection, project filesystem and credentials.
-The noVNC connection does not require a password. CDP listens inside the container on
+The noVNC WebSocket requires the environment's access token, which the dashboard
+link passes in noVNC's `path` setting. Environments started before this change
+keep accepting tokenless noVNC connections until they are stopped and started
+again; the services panel shows a notice until then. CDP listens inside the container on
 `127.0.0.1:9222` and `127.0.0.1:9224`. Raw CDP and VNC ports are not published to
 the host.
 
@@ -696,8 +702,10 @@ ssh -N \
   user@your-server
 ```
 
-Then open `http://127.0.0.1:8081/` or
-`http://127.0.0.1:6080/vnc.html` directly.
+Then open the links from the service-address panel after replacing each
+`host:port` with your local tunnel port, for example
+`http://127.0.0.1:8081/<token>/`. Keep the path and query: they carry the access
+token.
 ACF respects Docker contexts and `DOCKER_HOST`; published URLs refer to the
 Docker daemon's host. Internal Docker IPs may not be reachable directly on Docker
 Desktop.

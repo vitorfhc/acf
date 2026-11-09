@@ -69,14 +69,20 @@ All four desktop processes stay stopped until requested or enabled at boot.
 Upgrading an existing environment to the desktop requires the updated image and
 its published port; build and explicitly Apply configuration from the dashboard.
 
-The web file explorer is copied from Rookgaard and opens the container filesystem
-without a token or login. It provides a folder tree, breadcrumbs, text previews,
+The web file explorer is copied from Rookgaard and serves the container
+filesystem below a capability path: every route except the public
+`/assets/` libraries starts with `/<token>/`, where the token is read from
+`/run/acf/access-token` on each request. The host issues a new token at each
+environment start and writes it during Sync, on stdin like other secrets; until
+then the explorer answers 503. Cookies are deliberately not used, because
+browsers send them to every port on a host, including other projects' services.
+It provides a folder tree, breadcrumbs, text previews,
 rendered/raw Markdown, copy contents, uploads, and downloads. Quick access opens
 `/root`, `/root/Downloads`, or `/workspace`. Upload files shows the current folder
 (or a previewed file's parent) and lets the user choose Home Downloads instead
 for the whole selection. Each file has its own status and failed files can be
 retried without resending completed uploads.
-`GET /api/config` creates Downloads if missing. `POST /api/upload?path=DIR&name=NAME`
+`GET /<token>/api/config` creates Downloads if missing. `POST /<token>/api/upload?path=DIR&name=NAME`
 accepts one raw octet-stream file with `X-ACF-Upload: 1` per request, with no
 application size cap. The UI sends selected files in sequence. Uploads stream
 in 64 KiB chunks into temporary files and publish without overwriting existing names;
@@ -92,8 +98,12 @@ selecting a stopped profile starts it again. Both profiles share X display `:1`
 and one VNC connection while retaining separate Chromium processes, CDP ports,
 and the existing `/root/.config/acf/chromium-primary` and `chromium-secondary`
 data directories. Their cookies and sign-ins survive this layout change. They
-share the container filesystem and are not security boundaries. noVNC connects
-without a password. All Chromium web traffic uses Caido at
+share the container filesystem and are not security boundaries. websockify
+serves the noVNC page publicly but uses its `TokenFile` plugin, so a WebSocket
+connects only with `?token=<access token>` (from noVNC's `path` setting).
+Sync writes `/run/acf/novnc-token` and `/run/acf/desktop-token`, which map the
+token to the loopback-only VNC servers on 5901 and 5902; without them every
+connection is refused. All Chromium web traffic uses Caido at
 `http://127.0.0.1:8080`, including HTTP, HTTPS, WebSockets, localhost and link-local
 destinations. Mandatory Chromium policy also covers manual Chromium launches;
 there is no direct fallback when Caido is stopped or unavailable. QUIC and

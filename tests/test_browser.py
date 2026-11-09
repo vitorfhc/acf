@@ -36,7 +36,11 @@ class BrowserTopologyTests(unittest.TestCase):
                                          'desktop-display', 'desktop-session', 'desktop-vnc', 'desktop-http'})
         self.assertIn(':1', services['desktop'].command)
         self.assertIn('0.0.0.0:6080', services['novnc'].command)
-        self.assertIn('127.0.0.1:5901', services['novnc'].command)
+        # The VNC target comes from the token file the host writes during Sync.
+        command = services['novnc'].command
+        self.assertEqual(command[command.index('--token-plugin') + 1], 'TokenFile')
+        self.assertEqual(command[command.index('--token-source') + 1], '/run/acf/novnc-token')
+        self.assertNotIn('127.0.0.1:5901', command)
         self.assertIn('-localhost', services['vnc'].command)
         self.assertIn('-nopw', services['vnc'].command)
         self.assertNotIn('-rfbauth', services['vnc'].command)

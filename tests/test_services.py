@@ -97,6 +97,29 @@ class ServiceItemsTests(unittest.TestCase):
         self.assertEqual(by_name['files']['scope'], 'published')
         self.assertNotIn('novnc_secondary', by_name)
 
+    def test_files_and_vnc_urls_carry_the_access_token_but_other_services_do_not(self):
+        token = 'fixture-access-token-0123456789abcdefABCDEF'
+        self.published.update({'6082/tcp': [{'HostIp': '127.0.0.1', 'HostPort': '49155'}],
+                               '8080/tcp': [{'HostIp': '127.0.0.1', 'HostPort': '49156'}],
+                               '3000/tcp': [{'HostIp': '127.0.0.1', 'HostPort': '49157'}]})
+        listeners = [{'host': '0.0.0.0', 'port': 3000, 'protocol': 'http', 'name': 'app'}]
+        services = {name: {'state': 'running'} for name in ('files', 'novnc', 'desktop-http', 'caido')}
+        result = service_items(services, listeners, self.published, '172.30.0.2', self.settings,
+                               access_token=token)
+        by_name = {row['name']: row['address'] for row in result}
+        vnc = '/vnc.html?autoconnect=1&resize=remote&path=websockify%3Ftoken%3D' + token
+        self.assertEqual(by_name['files'], f'http://127.0.0.1:49153/{token}/')
+        self.assertEqual(by_name['novnc'], 'http://127.0.0.1:49154' + vnc)
+        self.assertEqual(by_name['desktop-http'], 'http://127.0.0.1:49155' + vnc)
+        self.assertEqual(by_name['caido'], 'http://127.0.0.1:49156/')
+        self.assertEqual(by_name['app'], 'http://127.0.0.1:49157/')
+        # Images without supervisor metadata still receive tokenized published URLs.
+        fallback = {row['name']: row['address'] for row in service_items(
+            {}, [], self.published, '172.30.0.2', self.settings, access_token=token)}
+        self.assertEqual(fallback['files'], f'http://127.0.0.1:49153/{token}/')
+        self.assertEqual(fallback['novnc'], 'http://127.0.0.1:49154' + vnc)
+        self.assertEqual(fallback['desktop-http'], 'http://127.0.0.1:49155' + vnc)
+
     def test_desktop_has_its_own_published_http_url_while_stopped(self):
         self.published['6082/tcp'] = [{'HostIp': '0.0.0.0', 'HostPort': '49180'}]
         with patch.object(addresses, 'local_host', return_value='192.168.1.40'):

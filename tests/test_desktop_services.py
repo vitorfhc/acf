@@ -44,7 +44,10 @@ class DesktopServiceTests(unittest.TestCase):
         self.assertEqual(supervisor.group_state(managed, supervisor.DESKTOP_SERVICES), 'stopped')
         self.assertTrue(managed['novnc'].enabled)
         self.assertIn('0.0.0.0:6082', managed['desktop-http'].command)
-        self.assertIn('127.0.0.1:5902', managed['desktop-http'].command)
+        command = managed['desktop-http'].command
+        self.assertEqual(command[command.index('--token-plugin') + 1], 'TokenFile')
+        self.assertEqual(command[command.index('--token-source') + 1], '/run/acf/desktop-token')
+        self.assertNotIn('127.0.0.1:5902', command)
         self.assertIn('-localhost', managed['desktop-vnc'].command)
         self.assertIn('-nopw', managed['desktop-vnc'].command)
         self.assertEqual(managed['desktop-http'].state()['endpoints'][0]['path'], '/')
@@ -129,7 +132,7 @@ class DesktopServiceTests(unittest.TestCase):
                     for request in requests:
                         request.result(timeout=1)
                 status = json.loads((run / 'status.json').read_text())
-                self.assertEqual(status['control_protocol'], 2)
+                self.assertEqual(status['control_protocol'], 3)
                 controls = {row['name']: row['state'] for row in status['service_controls']}
                 self.assertEqual(controls['desktop'], 'running')
                 self.assertEqual(controls['files'], 'stopped')

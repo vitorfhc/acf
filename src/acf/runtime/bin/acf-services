@@ -27,14 +27,17 @@ def control(action, name, run=RUN, timeout=90):
     if action not in ('start', 'stop', 'restart'):
         raise ValueError('Unknown service action.')
     names = set(status['services'])
-    if status.get('control_protocol') == 2:
+    # Protocol 2 added queued group requests; later versions keep them.
+    protocol = status.get('control_protocol')
+    queued = type(protocol) is int and protocol >= 2
+    if queued:
         names.update(('browser', 'desktop'))
     elif name in ('browser', 'desktop'):
         raise RuntimeError('Service groups need the updated supervisor. Stop and Start this environment in the dashboard; Desktop also needs the current container image.')
     if name not in names:
         raise ValueError('Unknown service. Available: ' + ', '.join(sorted(names)))
     deadline = time.monotonic() + timeout
-    if status.get('control_protocol') != 2:
+    if not queued:
         # Older supervisors have a one-slot mailbox. Serialize legacy callers
         # and wait for consumption instead of silently overwriting a request.
         with (run / 'control.lock').open('a') as lock:

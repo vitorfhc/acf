@@ -11,7 +11,8 @@ import time
 RUN = Path('/run/acf')
 LOG = Path('/var/log/acf')
 SETTINGS = Path('/opt/acf/service-settings.json')
-CONTROL_PROTOCOL = 2
+# 3: published noVNC endpoints require the host-issued access token.
+CONTROL_PROTOCOL = 3
 BROWSER_SERVICES = ('desktop', 'window-manager', 'vnc', 'novnc',
                     'browser-primary', 'browser-secondary')
 DESKTOP_SERVICES = ('desktop-display', 'desktop-session', 'desktop-vnc', 'desktop-http')
@@ -88,6 +89,16 @@ def service_settings():
     return {'desktop': settings.get('desktop', False)}
 
 
+def vnc_proxy(webroot, port, tokens):
+    """Serve noVNC publicly, but connect only WebSockets that carry this boot's token.
+
+    TokenFile rereads its source per connection, so Sync can deliver the token
+    after boot; a missing file refuses every connection.
+    """
+    return ['websockify', '--web', webroot, '--token-plugin', 'TokenFile',
+            '--token-source', str(tokens), f'0.0.0.0:{port}']
+
+
 def services(settings=None):
     settings = service_settings() if settings is None else settings
     enabled = os.environ.get('ACF_INTEGRATIONS', 'codex,claude,openrouter,glm,caido,oob').split(',')
@@ -96,7 +107,7 @@ def services(settings=None):
               Service('desktop', ['Xvfb', ':1', '-screen', '0', '1440x900x24', '-nolisten', 'tcp', '-ac']),
               Service('window-manager', ['/opt/acf/bin/acf-display', ':1', 'openbox', '--config-file', '/opt/acf/openbox.xml']),
               Service('vnc', ['/opt/acf/bin/acf-display', ':1', 'x11vnc', '-display', ':1', '-localhost', '-rfbport', '5901', '-nopw', '-forever', '-shared', '-noxdamage']),
-              Service('novnc', ['websockify', '--web', '/usr/share/novnc', '0.0.0.0:6080', '127.0.0.1:5901'])]
+              Service('novnc', vnc_proxy('/usr/share/novnc', 6080, RUN / 'novnc-token'))]
     for name in ('primary', 'secondary'):
         result.append(Service(f'browser-{name}', ['/opt/acf/bin/acf-display', ':1', '/opt/acf/bin/acf-browser', name, 'launch']))
     desktop_enabled = settings.get('desktop', False)
@@ -104,7 +115,7 @@ def services(settings=None):
         Service('desktop-display', ['Xvfb', ':2', '-screen', '0', '1440x900x24', '-nolisten', 'tcp', '-ac'], enabled=desktop_enabled),
         Service('desktop-session', ['/opt/acf/bin/acf-display', ':2', 'python3', '/opt/acf/desktop.py', 'session'], enabled=desktop_enabled),
         Service('desktop-vnc', ['/opt/acf/bin/acf-display', ':2', 'x11vnc', '-display', ':2', '-localhost', '-rfbport', '5902', '-nopw', '-forever', '-shared', '-noxdamage'], enabled=desktop_enabled),
-        Service('desktop-http', ['websockify', '--web', '/usr/share/acf-desktop', '0.0.0.0:6082', '127.0.0.1:5902'], enabled=desktop_enabled),
+        Service('desktop-http', vnc_proxy('/usr/share/acf-desktop', 6082, RUN / 'desktop-token'), enabled=desktop_enabled),
     ])
     return {service.name: service for service in result}
 

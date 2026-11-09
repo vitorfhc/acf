@@ -17,7 +17,7 @@ import urllib.request
 
 from acf.config import Config
 from acf.manager import Manager
-from test_integration import NOVNC_NO_AUTH_CHECK
+from test_integration import NOVNC_HANDSHAKE
 
 
 DESKTOP = ('desktop-display', 'desktop-session', 'desktop-vnc', 'desktop-http')
@@ -92,18 +92,23 @@ class DesktopIntegrationTests(unittest.TestCase):
                     raise
                 time.sleep(.5)
 
-    def no_auth_desktop(self, manager, container, port):
+    def token_desktop(self, manager, project, container, port):
+        """The framebuffer is reachable with this boot's token and refused without it."""
+        token = manager.state(project)['access_token']
         deadline = time.monotonic() + 30
         while True:
             result = manager.docker.run('exec', '--env',
-                f'ACF_TEST_NOVNC_URL=ws://127.0.0.1:{port}/websockify',
-                container, 'node', '-e', NOVNC_NO_AUTH_CHECK, check=False, timeout=15)
+                f'ACF_TEST_NOVNC_URL=ws://127.0.0.1:{port}/websockify?token={token}',
+                container, 'node', '-e', NOVNC_HANDSHAKE, check=False, timeout=15)
             if result.returncode == 0:
-                self.assertIn('connected without credentials', result.stdout)
-                return
+                self.assertIn('noVNC desktop connected', result.stdout)
+                break
             if time.monotonic() >= deadline:
                 self.fail(result.stderr or 'noVNC did not expose a usable framebuffer')
             time.sleep(.5)
+        refused = manager.docker.run('exec', '--env', f'ACF_TEST_NOVNC_URL=ws://127.0.0.1:{port}/websockify',
+                                     container, 'node', '-e', NOVNC_HANDSHAKE, check=False, timeout=15)
+        self.assertNotEqual(refused.returncode, 0, 'noVNC accepted a connection without the access token')
 
     def start_fake_ca(self, manager, project, container):
         manager.docker.run('exec', '-d', container, '/usr/bin/python3', '-c', CA_STUB)
@@ -197,15 +202,17 @@ enabled = []
                 self.assertTrue(all(binding['HostIp'] == '127.0.0.1'
                                     for bindings in ports.values() for binding in bindings or []))
                 self.assertNotEqual(info['ports']['desktop'], info['ports']['novnc'])
+                token = manager.state(project)['access_token']
                 desktop_url = f"http://127.0.0.1:{info['ports']['desktop']}/"
                 browser_url = f"http://127.0.0.1:{info['ports']['novnc']}/"
-                files_url = f"http://127.0.0.1:{info['ports']['files']}/"
+                files_url = f"http://127.0.0.1:{info['ports']['files']}/{token}/"
                 self.assertEqual(next(item['address'] for item in info['service_items']
-                                      if item['name'] == 'desktop-http'), desktop_url)
+                                      if item['name'] == 'desktop-http'),
+                                 desktop_url + 'vnc.html?autoconnect=1&resize=remote&path=websockify%3Ftoken%3D' + token)
                 before = self.wait_services(manager, project, BROWSER, 'running')
                 browser_pids = self.pids(before, BROWSER)
                 self.wait_http(browser_url)
-                self.no_auth_desktop(manager, container, 6080)
+                self.token_desktop(manager, project, container, 6080)
 
                 manager.service(project, 'start', 'desktop')
                 started = self.wait_services(manager, project, DESKTOP, 'running')
@@ -213,7 +220,7 @@ enabled = []
                 self.wait_http(desktop_url)
                 page = self.wait_http(desktop_url + 'vnc.html')
                 self.assertNotIn(b'acf-profiles.js', page)
-                self.no_auth_desktop(manager, container, 6082)
+                self.token_desktop(manager, project, container, 6082)
                 self.assertEqual(self.pids(started, BROWSER), browser_pids)
                 hold_seconds = min(300, max(0, int(os.environ.get('ACF_DESKTOP_TEST_HOLD_SECONDS', '0'))))
                 if hold_seconds:
@@ -227,7 +234,7 @@ enabled = []
                 self.assert_no_listener(manager, project, 6082)
                 self.assertEqual(self.pids(stopped, BROWSER), browser_pids)
                 self.wait_http(browser_url)
-                self.no_auth_desktop(manager, container, 6080)
+                self.token_desktop(manager, project, container, 6080)
 
                 manager.service(project, 'start', 'desktop')
                 desktop_pids = self.pids(self.wait_services(manager, project, DESKTOP, 'running'), DESKTOP)
@@ -236,12 +243,12 @@ enabled = []
                 self.assert_no_listener(manager, project, 6080)
                 self.assertEqual(self.pids(stopped, DESKTOP), desktop_pids)
                 self.wait_http(desktop_url)
-                self.no_auth_desktop(manager, container, 6082)
+                self.token_desktop(manager, project, container, 6082)
                 manager.service(project, 'start', 'browser')
                 restarted = self.wait_services(manager, project, BROWSER, 'running')
                 self.assertEqual(self.pids(restarted, DESKTOP), desktop_pids)
                 self.wait_http(browser_url)
-                self.no_auth_desktop(manager, container, 6080)
+                self.token_desktop(manager, project, container, 6080)
 
                 manager.service(project, 'stop', 'files')
                 self.wait_services(manager, project, ('files',), 'stopped')
@@ -269,7 +276,7 @@ enabled = []
                 self.wait_xfce(manager, project)
                 info = manager.details(project)
                 self.wait_http(f"http://127.0.0.1:{info['ports']['desktop']}/")
-                self.no_auth_desktop(manager, container, 6082)
+                self.token_desktop(manager, project, container, 6082)
                 self.assertTrue(manager.config.project(project)['services']['desktop'])
                 self.assertFalse(manager.config.reload()['services']['desktop'])
                 self.assertEqual(config_path.read_bytes(), defaults_before)

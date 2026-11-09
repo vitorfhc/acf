@@ -402,6 +402,72 @@ class ManagerTests(unittest.TestCase):
         self.assertIn('chmod 600', json_write.args[-1])
         self.assertIn('chmod 600', key_write.args[-1])
 
+    def running_project(self, save=True):
+        """A running workload in its expected guard namespace."""
+        self.config.initialize()
+        if save:
+            self.manager.save('demo', self.state)
+        container, guard, _ = self.manager.names('demo')
+        workload, guard_object = self.object(), self.object()
+        workload['HostConfig']['NetworkMode'] = 'container:' + guard
+        self.manager.owned = Mock(side_effect=lambda kind, name: workload if name == container else guard_object)
+        return guard_object
+
+    def test_access_token_rotates_on_each_boot_but_not_when_attaching(self):
+        self.setup_start()
+        self.manager._guard_ready = Mock()
+        self.manager.start('demo')
+        first = self.manager.state('demo')['access_token']
+        self.assertRegex(first, r'^[A-Za-z0-9_-]{43}$')
+        self.manager.start('demo')
+        second = self.manager.state('demo')['access_token']
+        self.assertNotEqual(second, first)
+        # Attaching to a running environment must not break open browser tabs.
+        self.running_project(save=False)
+        self.manager.start('demo')
+        self.assertEqual(self.manager.state('demo')['access_token'], second)
+
+    def test_sync_delivers_access_token_on_stdin_to_files_and_vnc_proxies(self):
+        self.running_project()
+        self.manager.sync('demo')
+        token = self.manager.state('demo')['access_token']
+        self.assertRegex(token, r'^[A-Za-z0-9_-]{43}$')
+        calls = self.docker.run.call_args_list
+        write = next(call for call in calls if '/run/acf/access-token' in str(call.args))
+        self.assertEqual(write.kwargs['input'], token + '\n')
+        script = write.args[-1]
+        self.assertIn('umask 077', script)
+        self.assertIn("'%s: 127.0.0.1:5901\\n'", script)
+        self.assertIn("'%s: 127.0.0.1:5902\\n'", script)
+        for name in ('access', 'novnc', 'desktop'):
+            self.assertIn(f'/run/acf/{name}-token', script.replace('$name', name))
+        for call in calls:
+            self.assertNotIn(token, str(call.args))
+        # A repeated Sync keeps the token the running services already accept.
+        self.manager.sync('demo')
+        self.assertEqual(self.manager.state('demo')['access_token'], token)
+
+    def test_dashboard_urls_carry_the_access_token_and_old_supervisors_are_flagged(self):
+        token = 'fixture-access-token-0123456789abcdefABCDEF'
+        self.state['access_token'] = token
+        guard = self.running_project()
+        guard['NetworkSettings']['Ports'] = {'8081/tcp': [{'HostIp': '127.0.0.1', 'HostPort': '45000'}],
+                                             '6080/tcp': [{'HostIp': '127.0.0.1', 'HostPort': '45001'}]}
+        report = {'services': {'files': {'state': 'running'}, 'novnc': {'state': 'running'}}, 'control_protocol': 2}
+        self.docker.run.return_value = Mock(returncode=0, stdout=json.dumps(report), stderr='')
+        details = self.manager.details('demo')
+        self.assertEqual(details['urls']['files'], f'http://127.0.0.1:45000/{token}/')
+        self.assertTrue(details['urls']['novnc'].endswith('path=websockify%3Ftoken%3D' + token))
+        self.assertIn('without an access token until this environment restarts', details['service_notice'])
+        report['control_protocol'] = 3
+        self.docker.run.return_value = Mock(returncode=0, stdout=json.dumps(report), stderr='')
+        self.assertNotIn('service_notice', self.manager.details('demo'))
+        # A malformed saved token is never shown as part of a link.
+        state = self.manager.state('demo')
+        state['access_token'] = 'short'
+        self.manager.save('demo', state)
+        self.assertEqual(self.manager.details('demo')['urls']['files'], 'http://127.0.0.1:45000/')
+
     def test_missing_ssh_key_does_not_recreate_existing_container(self):
         self.config.initialize()
         self.manager.save('demo', self.state)

@@ -25,7 +25,7 @@ class Element {
     close() { this.open = false; }
 }
 
-function harness({upload = {ok: true, status: 201, result: {path: '/workspace/reports/report.txt'}}, configError = false} = {}) {
+function harness({upload = {ok: true, status: 201, result: {path: '/workspace/reports/report.txt'}}, configError = false, base = ''} = {}) {
     const nodes = new Map(), requests = [], rendered = [];
     const node = id => {
         if (!nodes.has(id)) nodes.set(id, new Element());
@@ -36,20 +36,22 @@ function harness({upload = {ok: true, status: 201, result: {path: '/workspace/re
         document: {getElementById: node, createElement: tag => new Element(tag),
             createElementNS: (namespace, tag) => Object.assign(new Element(tag), {namespaceURI: namespace}),
             createTextNode: text => ({textContent: text})},
-        location: {origin: 'http://files.test:8081', pathname: '/browse/workspace/reports', hash: ''},
+        location: {origin: 'http://files.test:8081', pathname: base + '/browse/workspace/reports', hash: ''},
         history: {pushState() {}},
         setTimeout: () => 1, clearTimeout() {},
         async fetch(url, options = {}) {
             url = new URL(url); requests.push({url, options});
+            assert.ok(url.pathname.startsWith(base + '/api/'), `request outside the access token: ${url}`);
+            const route = url.pathname.slice(base.length);
             if (options.method === 'POST') {
                 const response = typeof upload === 'function' ? await upload(url, options) : upload;
                 return {ok: response.ok, status: response.status, json: async () => response.result};
             }
-            if (url.pathname === '/api/config') {
+            if (route === '/api/config') {
                 if (configError) return {ok: false, status: 503, json: async () => ({error: 'Settings unavailable'})};
                 return {ok: true, json: async () => ({home: '/root', downloads: '/root/Downloads'})};
             }
-            assert.equal(url.pathname, '/api/stat');
+            assert.equal(route, '/api/stat');
             return {ok: true, json: async () => ({kind: url.searchParams.get('path').endsWith('.txt') ? 'file' : 'directory'})};
         },
     });
@@ -241,4 +243,17 @@ test('an invalid name does not stop later valid files in the same batch', async 
     assert.match(app.statuses()[0].textContent, /without folders or slashes/);
     assert.equal(app.statuses()[1].textContent, 'Uploaded');
     assert.equal(app.node('upload-dialog').open, true);
+});
+
+test('uploads, settings, and shortcuts stay below the access token path prefix', async () => {
+    const base = '/fixture-access-token-0123456789abcdefABCDEF';
+    const app = harness({base});
+    await app.prepare();
+    assert.equal(app.node('upload-destination').textContent, '/workspace/reports');
+    const downloads = app.node('shortcuts').children.find(link => link.dataset.path === '/root/Downloads');
+    assert.equal(downloads.href, base + '/browse/root/Downloads');
+    app.select();
+    await app.context.submitUpload(app.event);
+    assert.equal(app.posts()[0].url.pathname, base + '/api/upload');
+    assert.equal(app.posts()[0].url.searchParams.get('path'), '/workspace/reports');
 });
